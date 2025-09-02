@@ -1,0 +1,218 @@
+name: 🔍 CI - Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress workflows on new pushes to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  # Bundle size limits (in bytes)
+  MAX_BUNDLE_SIZE: '500000'  # 500KB
+  MAX_CHUNK_SIZE: '200000'   # 200KB
+
+jobs:
+  # Job 1: Install dependencies with caching
+  install:
+    name: 📦 Install Dependencies
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 🗄️ Cache node_modules
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: 📥 Install dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit
+
+  # Job 2: TypeScript type checking
+  type-check:
+    name: 🔧 TypeScript Check
+    runs-on: ubuntu-latest
+    needs: install
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 🗄️ Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+      - name: ✅ Type check
+        run: npm run type-check
+
+  # Job 3: ESLint checking
+  lint:
+    name: 🧹 ESLint
+    runs-on: ubuntu-latest
+    needs: install
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 🗄️ Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+      - name: 🧹 Run ESLint
+        run: npm run lint
+
+  # Job 4: Build validation with bundle analysis
+  build:
+    name: 🏗️ Build & Bundle Analysis
+    runs-on: ubuntu-latest
+    needs: install
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 🗄️ Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+      - name: 🗄️ Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .next/cache
+            .next/static
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}-${{ hashFiles('**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}-
+
+      - name: 🏗️ Build application
+        run: npm run build
+        env:
+          # Prevent telemetry during CI
+          NEXT_TELEMETRY_DISABLED: 1
+
+      - name: 📊 Analyze bundle size
+        run: |
+          # Get build info
+          if [ -f ".next/build-manifest.json" ]; then
+            echo "Build completed successfully"
+            
+            # Check if standalone build exists (for production)
+            if [ -d ".next/standalone" ]; then
+              echo "✅ Standalone build created"
+            fi
+            
+            # Analyze bundle sizes (basic check)
+            echo "📦 Bundle analysis:"
+            find .next/static -name "*.js" -exec du -h {} + | sort -hr | head -10 || echo "No JS bundles found"
+          else
+            echo "❌ Build manifest not found"
+            exit 1
+          fi
+
+      - name: 🗄️ Store build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-build
+          path: |
+            .next/
+            !.next/cache
+          retention-days: 1
+
+  # Job 5: Run tests (if they exist)
+  test:
+    name: 🧪 Tests
+    runs-on: ubuntu-latest
+    needs: install
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 🗄️ Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+      - name: 🧪 Run tests
+        run: npm run test
+
+  # Job 6: Quality gate (all jobs must pass)
+  quality-gate:
+    name: ✅ Quality Gate
+    runs-on: ubuntu-latest
+    needs: [type-check, lint, build, test]
+    if: always()
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: ✅ Check all jobs status
+        run: |
+          echo "Type check: ${{ needs.type-check.result }}"
+          echo "Lint: ${{ needs.lint.result }}"
+          echo "Build: ${{ needs.build.result }}"
+          echo "Test: ${{ needs.test.result }}"
+          
+          if [[ "${{ needs.type-check.result }}" != "success" ]] || \
+             [[ "${{ needs.lint.result }}" != "success" ]] || \
+             [[ "${{ needs.build.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "❌ One or more quality checks failed"
+            exit 1
+          fi
+          
+          echo "✅ All quality checks passed"
+
+      - name: 📝 Summary
+        run: |
+          echo "## 🎉 CI Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| TypeScript | ${{ needs.type-check.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ESLint | ${{ needs.lint.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | ${{ needs.test.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY

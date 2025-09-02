@@ -1,0 +1,335 @@
+name: 🗄️ Database Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+      - 'sql/**'
+      - 'database/**'
+      - '*.sql'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+      - 'sql/**'
+      - 'database/**'
+      - '*.sql'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  SUPABASE_CLI_VERSION: '1.136.3'
+
+jobs:
+  # Job 1: SQL syntax and migration validation
+  sql-validation:
+    name: 🔍 SQL Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Needed to detect changed files
+
+      - name: 🔍 Find SQL files
+        id: find-sql
+        run: |
+          # Find all SQL files in the repository
+          sql_files=$(find . -name "*.sql" -not -path "./node_modules/*" -not -path "./.git/*" | head -20)
+          migration_files=$(find . -path "*/migrations/*" -name "*.sql" 2>/dev/null | head -20)
+          
+          echo "SQL files found:"
+          echo "$sql_files"
+          echo "Migration files found:"
+          echo "$migration_files"
+          
+          # Check if we have any SQL files to validate
+          if [ -z "$sql_files" ] && [ -z "$migration_files" ]; then
+            echo "has_sql=false" >> $GITHUB_OUTPUT
+            echo "No SQL files found to validate"
+          else
+            echo "has_sql=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: ✅ Basic SQL syntax validation
+        if: steps.find-sql.outputs.has_sql == 'true'
+        run: |
+          echo "🔍 Performing basic SQL syntax validation..."
+          
+          # Function to validate SQL syntax
+          validate_sql_file() {
+            local file="$1"
+            echo "Validating: $file"
+            
+            # Basic syntax checks
+            if grep -q "DROP TABLE" "$file" && ! grep -q "IF EXISTS" "$file"; then
+              echo "⚠️ Warning: DROP TABLE without IF EXISTS in $file"
+            fi
+            
+            if grep -q "ALTER TABLE.*DROP COLUMN" "$file"; then
+              echo "⚠️ Warning: DROP COLUMN operation in $file - ensure data safety"
+            fi
+            
+            # Check for common SQL injection patterns (shouldn't be in migrations but good to check)
+            if grep -qi "';.*--\|union.*select\|insert.*values.*(" "$file"; then
+              echo "❌ Suspicious SQL pattern in $file"
+              return 1
+            fi
+            
+            echo "✅ Basic validation passed for $file"
+            return 0
+          }
+          
+          # Validate all SQL files
+          validation_failed=false
+          
+          while IFS= read -r -d '' file; do
+            if [ -f "$file" ]; then
+              validate_sql_file "$file" || validation_failed=true
+            fi
+          done < <(find . -name "*.sql" -not -path "./node_modules/*" -not -path "./.git/*" -print0)
+          
+          if [ "$validation_failed" = true ]; then
+            echo "❌ SQL validation failed"
+            exit 1
+          else
+            echo "✅ All SQL files passed basic validation"
+          fi
+
+  # Job 2: Migration structure validation
+  migration-validation:
+    name: 📋 Migration Structure Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📋 Validate migration structure
+        run: |
+          echo "📋 Checking migration file structure..."
+          
+          migration_dir=""
+          
+          # Look for Supabase migrations directory
+          if [ -d "supabase/migrations" ]; then
+            migration_dir="supabase/migrations"
+          elif [ -d "sql/migrations" ]; then
+            migration_dir="sql/migrations"
+          elif [ -d "database/migrations" ]; then
+            migration_dir="database/migrations"
+          elif [ -d "migrations" ]; then
+            migration_dir="migrations"
+          else
+            echo "ℹ️ No migrations directory found - this is expected for new projects"
+            exit 0
+          fi
+          
+          echo "Found migrations directory: $migration_dir"
+          
+          # Check migration naming convention
+          migration_files=$(find "$migration_dir" -name "*.sql" -type f | sort)
+          
+          if [ -z "$migration_files" ]; then
+            echo "ℹ️ No migration files found in $migration_dir"
+            exit 0
+          fi
+          
+          echo "Migration files found:"
+          echo "$migration_files"
+          
+          # Validate each migration file
+          for file in $migration_files; do
+            filename=$(basename "$file")
+            
+            # Check if filename follows timestamp pattern
+            if [[ ! "$filename" =~ ^[0-9]{14}_.*\.sql$ ]] && [[ ! "$filename" =~ ^[0-9]{10}_.*\.sql$ ]]; then
+              echo "⚠️ Migration file '$filename' doesn't follow timestamp naming convention"
+            fi
+            
+            # Check for rollback comments or down migrations
+            if grep -q "-- down\|-- rollback\|-- undo" "$file"; then
+              echo "✅ Found rollback instructions in $filename"
+            else
+              echo "⚠️ No rollback instructions found in $filename - consider adding them"
+            fi
+            
+            # Check for RLS policies in table creation
+            if grep -q "CREATE TABLE" "$file"; then
+              if grep -q "RLS\|row.*level.*security" "$file"; then
+                echo "✅ RLS mentioned in $filename"
+              else
+                echo "⚠️ CREATE TABLE without RLS policy in $filename - ensure security is considered"
+              fi
+            fi
+          done
+
+  # Job 3: RLS Policy validation
+  rls-validation:
+    name: 🔒 RLS Policy Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔒 Check RLS policies
+        run: |
+          echo "🔒 Checking Row Level Security policies..."
+          
+          # Find all SQL files
+          sql_files=$(find . -name "*.sql" -not -path "./node_modules/*" -not -path "./.git/*")
+          
+          if [ -z "$sql_files" ]; then
+            echo "ℹ️ No SQL files found to check for RLS policies"
+            exit 0
+          fi
+          
+          tables_without_rls=""
+          tables_with_rls=""
+          
+          for file in $sql_files; do
+            echo "Checking $file..."
+            
+            # Look for CREATE TABLE statements
+            table_names=$(grep -i "CREATE TABLE" "$file" | sed -n 's/.*CREATE TABLE[[:space:]]\+\([a-zA-Z_][a-zA-Z0-9_]*\).*/\1/p' || true)
+            
+            for table in $table_names; do
+              if [ -n "$table" ]; then
+                # Check if RLS is enabled for this table
+                if grep -q "ALTER TABLE.*$table.*ENABLE.*RLS\|ALTER TABLE.*$table.*ROW.*LEVEL.*SECURITY" "$file"; then
+                  tables_with_rls="$tables_with_rls $table"
+                  echo "✅ Table '$table' has RLS enabled"
+                else
+                  tables_without_rls="$tables_without_rls $table"
+                  echo "⚠️ Table '$table' created without explicit RLS enablement"
+                fi
+                
+                # Check for policies
+                if grep -q "CREATE POLICY.*$table\|POLICY.*ON.*$table" "$file"; then
+                  echo "✅ Policies found for table '$table'"
+                else
+                  echo "⚠️ No policies found for table '$table'"
+                fi
+              fi
+            done
+          done
+          
+          echo ""
+          echo "📊 RLS Summary:"
+          if [ -n "$tables_with_rls" ]; then
+            echo "✅ Tables with RLS:$tables_with_rls"
+          fi
+          if [ -n "$tables_without_rls" ]; then
+            echo "⚠️ Tables without explicit RLS:$tables_without_rls"
+            echo "Ensure these tables don't contain sensitive data or add RLS policies"
+          fi
+
+  # Job 4: Supabase CLI validation (if possible)
+  supabase-cli-check:
+    name: 🚀 Supabase CLI Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🚀 Install Supabase CLI
+        run: |
+          curl -sSfL https://github.com/supabase/cli/releases/download/v${{ env.SUPABASE_CLI_VERSION }}/supabase_linux_amd64.tar.gz | tar -xz
+          sudo mv supabase /usr/local/bin/
+          supabase --version
+
+      - name: ✅ Validate Supabase configuration
+        run: |
+          if [ -f "supabase/config.toml" ]; then
+            echo "✅ Found Supabase config file"
+            supabase status --workdir . || echo "⚠️ Could not check Supabase status (expected without local instance)"
+          else
+            echo "ℹ️ No Supabase config.toml found"
+          fi
+          
+          # Check if migrations are valid
+          if [ -d "supabase/migrations" ]; then
+            echo "📁 Migration files:"
+            ls -la supabase/migrations/ || echo "No migration files"
+          fi
+
+  # Job 5: Database security check
+  db-security-check:
+    name: 🔐 Database Security Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Check for security best practices
+        run: |
+          echo "🔐 Checking database security best practices..."
+          
+          sql_files=$(find . -name "*.sql" -not -path "./node_modules/*" -not -path "./.git/*" | head -20)
+          
+          if [ -z "$sql_files" ]; then
+            echo "ℹ️ No SQL files found"
+            exit 0
+          fi
+          
+          security_issues=0
+          
+          for file in $sql_files; do
+            echo "Checking security in: $file"
+            
+            # Check for public schema access
+            if grep -qi "GRANT.*PUBLIC" "$file"; then
+              echo "⚠️ PUBLIC grants found in $file - review permissions"
+              security_issues=$((security_issues + 1))
+            fi
+            
+            # Check for overly permissive policies
+            if grep -qi "POLICY.*true\|POLICY.*1=1" "$file"; then
+              echo "❌ Overly permissive RLS policy in $file"
+              security_issues=$((security_issues + 1))
+            fi
+            
+            # Check for hardcoded credentials (shouldn't be in migrations)
+            if grep -qi "password.*=.*['\"][^'\"]*['\"]" "$file"; then
+              echo "❌ Potential hardcoded password in $file"
+              security_issues=$((security_issues + 1))
+            fi
+            
+            # Check for proper UUID usage for IDs
+            if grep -qi "CREATE TABLE.*id.*serial\|CREATE TABLE.*id.*integer" "$file" && ! grep -qi "uuid" "$file"; then
+              echo "⚠️ Consider using UUID instead of serial/integer for IDs in $file"
+            fi
+          done
+          
+          if [ $security_issues -gt 0 ]; then
+            echo "❌ Found $security_issues potential security issues"
+            echo "Review the above warnings and ensure they are intentional"
+            exit 1
+          else
+            echo "✅ No obvious security issues found"
+          fi
+
+  # Job 6: Database summary
+  database-summary:
+    name: 📋 Database Summary
+    runs-on: ubuntu-latest
+    needs: [sql-validation, migration-validation, rls-validation, db-security-check]
+    if: always()
+    steps:
+      - name: 📋 Generate database summary
+        run: |
+          echo "## 🗄️ Database Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SQL Validation | ${{ needs.sql-validation.result == 'success' && '✅ Passed' || needs.sql-validation.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Migration Structure | ${{ needs.migration-validation.result == 'success' && '✅ Passed' || needs.migration-validation.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| RLS Policies | ${{ needs.rls-validation.result == 'success' && '✅ Passed' || needs.rls-validation.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Check | ${{ needs.db-security-check.result == 'success' && '✅ Passed' || needs.db-security-check.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔒 Security Reminders" >> $GITHUB_STEP_SUMMARY
+          echo "- All sensitive tables should have RLS enabled" >> $GITHUB_STEP_SUMMARY
+          echo "- Use UUIDs for primary keys when possible" >> $GITHUB_STEP_SUMMARY
+          echo "- Always include rollback instructions in migrations" >> $GITHUB_STEP_SUMMARY
+          echo "- Test migrations on staging before production" >> $GITHUB_STEP_SUMMARY

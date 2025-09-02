@@ -10,6 +10,11 @@ on:
   pull_request_review:
     types: [submitted]
 
+# Concurrency control: one Claude instance per issue/PR
+concurrency:
+  group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false  # Don't cancel in-progress Claude responses
+
 jobs:
   claude:
     if: |
@@ -18,6 +23,9 @@ jobs:
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Prevent long-running jobs
+    environment:
+      name: claude-interactions  # Optional: require manual approval for sensitive repos
     permissions:
       contents: read
       pull-requests: read
@@ -30,9 +38,37 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Validate Claude Invocation
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Check for potential abuse patterns
+            const body = context.payload.comment?.body || 
+                         context.payload.review?.body || 
+                         context.payload.issue?.body || '';
+            
+            // Rate limit check (example: max 10 Claude calls per hour per user)
+            const user = context.payload.sender.login;
+            console.log(`Claude invoked by: ${user}`);
+            
+            // Check if user is a collaborator (optional security)
+            if (context.payload.repository.private) {
+              try {
+                await github.rest.repos.checkCollaborator({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: user
+                });
+              } catch (error) {
+                core.setFailed('Only collaborators can invoke Claude on private repos');
+              }
+            }
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
+        continue-on-error: true  # Handle failures gracefully
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           
@@ -40,11 +76,28 @@ jobs:
           additional_permissions: |
             actions: read
 
-          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
-          # prompt: 'Update the pull request description to include a summary of changes.'
+          # Add context about project requirements
+          prompt_prefix: |
+            Important: Follow the guidelines in CLAUDE.md. 
+            Focus on: Security/PII, i18n (fr/nl/en), performance, tests, MVP0 DoD alignment.
+            Be concise and actionable.
 
           # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://docs.anthropic.com/en/docs/claude-code/sdk#command-line for available options
-          # claude_args: '--model claude-opus-4-1-20250805 --allowed-tools Bash(gh pr:*)'
+          # Restrict tools for safety
+          claude_args: '--allowed-tools "Bash(gh issue:*),Bash(gh pr:*),Bash(gh search:*),Read,Grep,Glob"'
+
+      - name: Handle Claude Failure
+        if: steps.claude.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.issue?.number || context.payload.pull_request?.number;
+            if (issueNumber) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: '⚠️ Claude failed to respond. Please try again or contact maintainers.'
+              });
+            }
 

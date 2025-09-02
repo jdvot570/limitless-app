@@ -6,7 +6,9 @@
     "dev": "next dev --turbopack",
     "build": "next build --turbopack",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "type-check": "tsc --noEmit",
+    "test": "echo \"No tests yet\""
   },
   "dependencies": {
     "@stripe/stripe-js": "^7.9.0",

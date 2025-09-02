@@ -1,0 +1,436 @@
+name: 🌍 i18n Validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  # Supported locales for Limitless MVP0
+  SUPPORTED_LOCALES: 'fr,nl,en'
+
+jobs:
+  # Job 1: Find and validate translation files
+  find-translations:
+    name: 🔍 Find Translation Files
+    runs-on: ubuntu-latest
+    outputs:
+      has_translations: ${{ steps.check.outputs.has_translations }}
+      translation_dirs: ${{ steps.check.outputs.translation_dirs }}
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔍 Locate translation files
+        id: check
+        run: |
+          echo "🔍 Looking for i18n translation files..."
+          
+          # Common i18n directories and patterns
+          possible_dirs=(
+            "messages"
+            "locales"
+            "translations" 
+            "i18n"
+            "public/locales"
+            "src/messages"
+            "src/locales"
+            "src/i18n"
+            "app/messages"
+            "app/locales"
+            "lib/messages"
+            "lib/locales"
+          )
+          
+          found_dirs=""
+          has_files=false
+          
+          for dir in "${possible_dirs[@]}"; do
+            if [ -d "$dir" ]; then
+              echo "Found directory: $dir"
+              files=$(find "$dir" -name "*.json" -o -name "*.ts" -o -name "*.js" | head -5)
+              if [ ! -z "$files" ]; then
+                echo "  Files in $dir:"
+                echo "$files" | sed 's/^/    /'
+                found_dirs="$found_dirs $dir"
+                has_files=true
+              fi
+            fi
+          done
+          
+          # Also look for next-intl pattern files
+          intl_files=$(find . -name "*.json" -path "*/messages/*" -o -name "*.json" -path "*/locales/*" 2>/dev/null | grep -v node_modules | head -10)
+          if [ ! -z "$intl_files" ]; then
+            echo "Found next-intl files:"
+            echo "$intl_files"
+            has_files=true
+          fi
+          
+          if [ "$has_files" = true ]; then
+            echo "has_translations=true" >> $GITHUB_OUTPUT
+            echo "translation_dirs=$found_dirs" >> $GITHUB_OUTPUT
+            echo "✅ Translation files found"
+          else
+            echo "has_translations=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No translation files found - this may be expected for new projects"
+          fi
+
+  # Job 2: Validate translation structure
+  validate-structure:
+    name: 📋 Validate Translation Structure  
+    runs-on: ubuntu-latest
+    needs: find-translations
+    if: needs.find-translations.outputs.has_translations == 'true'
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 📋 Validate translation files structure
+        run: |
+          echo "📋 Validating translation file structure for locales: $SUPPORTED_LOCALES"
+          
+          IFS=',' read -ra LOCALES <<< "$SUPPORTED_LOCALES"
+          
+          # Function to validate JSON structure
+          validate_json() {
+            local file="$1"
+            if ! python3 -m json.tool "$file" > /dev/null 2>&1; then
+              echo "❌ Invalid JSON in $file"
+              return 1
+            fi
+            return 0
+          }
+          
+          # Find all translation files
+          translation_files=$(find . -name "*.json" \( -path "*/messages/*" -o -path "*/locales/*" -o -path "*/i18n/*" -o -path "*/translations/*" \) | grep -v node_modules)
+          
+          if [ -z "$translation_files" ]; then
+            echo "No JSON translation files found"
+            exit 0
+          fi
+          
+          validation_errors=0
+          
+          echo "Found translation files:"
+          for file in $translation_files; do
+            echo "  $file"
+            
+            # Validate JSON syntax
+            if ! validate_json "$file"; then
+              validation_errors=$((validation_errors + 1))
+              continue
+            fi
+            
+            # Check if file follows locale naming convention
+            filename=$(basename "$file" .json)
+            found_locale=false
+            
+            for locale in "${LOCALES[@]}"; do
+              if [[ "$file" == *"$locale"* ]] || [[ "$filename" == "$locale" ]]; then
+                echo "    ✅ Matches locale: $locale"
+                found_locale=true
+                break
+              fi
+            done
+            
+            if [ "$found_locale" = false ]; then
+              echo "    ⚠️ No matching locale found for $file"
+            fi
+          done
+          
+          if [ $validation_errors -gt 0 ]; then
+            echo "❌ Found $validation_errors validation errors"
+            exit 1
+          else
+            echo "✅ All translation files have valid structure"
+          fi
+
+  # Job 3: Check translation key consistency
+  check-key-consistency:
+    name: 🔑 Check Translation Keys
+    runs-on: ubuntu-latest
+    needs: find-translations
+    if: needs.find-translations.outputs.has_translations == 'true'
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js  
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 🔑 Check translation key consistency
+        run: |
+          echo "🔑 Checking translation key consistency across locales..."
+          
+          IFS=',' read -ra LOCALES <<< "$SUPPORTED_LOCALES"
+          
+          # Create a temporary script to compare JSON keys
+          cat > compare_keys.py << 'EOF'
+          import json
+          import sys
+          import os
+          from pathlib import Path
+          
+          def get_keys(obj, prefix=''):
+              keys = set()
+              if isinstance(obj, dict):
+                  for key, value in obj.items():
+                      full_key = f"{prefix}.{key}" if prefix else key
+                      keys.add(full_key)
+                      if isinstance(value, dict):
+                          keys.update(get_keys(value, full_key))
+              return keys
+          
+          def compare_translation_files():
+              locales = sys.argv[1].split(',')
+              print(f"Comparing keys for locales: {locales}")
+              
+              locale_keys = {}
+              
+              # Find translation files for each locale
+              for locale in locales:
+                  locale_files = []
+                  for root, dirs, files in os.walk('.'):
+                      if 'node_modules' in root:
+                          continue
+                      for file in files:
+                          if file.endswith('.json'):
+                              file_path = os.path.join(root, file)
+                              if locale in file_path or file.replace('.json', '') == locale:
+                                  locale_files.append(file_path)
+                  
+                  if not locale_files:
+                      print(f"⚠️ No translation files found for locale: {locale}")
+                      continue
+                      
+                  all_keys = set()
+                  for file_path in locale_files:
+                      try:
+                          with open(file_path, 'r', encoding='utf-8') as f:
+                              data = json.load(f)
+                              file_keys = get_keys(data)
+                              all_keys.update(file_keys)
+                              print(f"  📄 {file_path}: {len(file_keys)} keys")
+                      except Exception as e:
+                          print(f"❌ Error reading {file_path}: {e}")
+                          
+                  locale_keys[locale] = all_keys
+              
+              # Compare keys between locales
+              if len(locale_keys) < 2:
+                  print("ℹ️ Need at least 2 locales to compare keys")
+                  return
+              
+              base_locale = locales[0]
+              base_keys = locale_keys.get(base_locale, set())
+              
+              inconsistencies = False
+              
+              for locale, keys in locale_keys.items():
+                  if locale == base_locale:
+                      continue
+                      
+                  missing_keys = base_keys - keys
+                  extra_keys = keys - base_keys
+                  
+                  if missing_keys:
+                      print(f"❌ {locale} missing keys from {base_locale}:")
+                      for key in sorted(missing_keys)[:10]:  # Show first 10
+                          print(f"    - {key}")
+                      if len(missing_keys) > 10:
+                          print(f"    ... and {len(missing_keys) - 10} more")
+                      inconsistencies = True
+                      
+                  if extra_keys:
+                      print(f"⚠️ {locale} has extra keys not in {base_locale}:")
+                      for key in sorted(extra_keys)[:10]:  # Show first 10
+                          print(f"    + {key}")
+                      if len(extra_keys) > 10:
+                          print(f"    ... and {len(extra_keys) - 10} more")
+                      inconsistencies = True
+              
+              if not inconsistencies:
+                  print("✅ All locales have consistent keys")
+                  return True
+              
+              return False
+          
+          if __name__ == "__main__":
+              success = compare_translation_files()
+              sys.exit(0 if success else 1)
+          EOF
+          
+          python3 compare_keys.py "$SUPPORTED_LOCALES"
+
+  # Job 4: Scan for hardcoded text
+  scan-hardcoded-text:
+    name: 🔍 Scan for Hardcoded Text
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔍 Scan for hardcoded French/Dutch/English text
+        run: |
+          echo "🔍 Scanning for hardcoded text that should be internationalized..."
+          
+          # Define patterns that indicate hardcoded text in French, Dutch, or English
+          FRENCH_PATTERNS=(
+            "\"[^\"]*\b(le|la|les|un|une|du|de|des|et|ou|avec|sans|pour|par|dans|sur|sous|entre|chez|vers|pendant|depuis|avant|après|malgré|selon|contre|parmi|envers|hormis|sauf|excepté|durant|moyennant|nonobstant|suivant|touchant|concernant|regarding)\b[^\"]*\""
+            "\"[^\"]*\b(bonjour|bonsoir|merci|salut|oui|non|peut-être|aujourd'hui|demain|hier|maintenant|toujours|jamais|souvent|parfois|quelquefois|beaucoup|peu|très|assez|trop|plus|moins|aussi|encore|déjà|bientôt|tard|tôt|ici|là|partout|nulle part)\b[^\"]*\""
+          )
+          
+          DUTCH_PATTERNS=(
+            "\"[^\"]*\b(de|het|een|van|in|op|aan|bij|met|voor|door|over|onder|tussen|tegen|zonder|sinds|tijdens|na|voor|volgens|behalve|uitgezonderd|gedurende|niettegenstaande|aangaande|betreffende|omtrent)\b[^\"]*\""
+            "\"[^\"]*\b(hallo|goedemorgen|goedemiddag|goedenavond|bedankt|ja|nee|misschien|vandaag|morgen|gisteren|nu|altijd|nooit|vaak|soms|veel|weinig|zeer|genoeg|teveel|meer|minder|ook|nog|al|binnenkort|laat|vroeg|hier|daar|overal|nergens)\b[^\"]*\""
+          )
+          
+          ENGLISH_PATTERNS=(
+            "\"[^\"]*\b(the|and|or|but|with|without|for|from|about|above|below|between|during|before|after|since|until|while|because|although|however|therefore|moreover|furthermore|nevertheless|consequently|meanwhile|otherwise|instead|besides|except|unless|whether|either|neither|both|all|any|some|many|few|several|each|every|other|another|such|same|different|various|certain|particular|general|specific|special|important|necessary|possible|available|interested|concerned|involved|related|similar|different|appropriate|suitable|relevant|significant|effective|efficient|successful|useful|helpful|valuable|expensive|cheap|free|easy|difficult|hard|simple|complex|complicated|clear|obvious|certain|sure|confident|doubtful|uncertain|confused|surprised|excited|disappointed|satisfied|pleased|happy|sad|angry|worried|tired|busy|ready|careful|responsible|serious|funny|strange|normal|usual|common|rare|unique|typical|popular|famous|important|main|major|minor|local|national|international|global|public|private|personal|professional|official|formal|informal|direct|indirect|positive|negative|good|bad|better|worse|best|worst|high|low|big|small|large|little|long|short|wide|narrow|thick|thin|heavy|light|fast|slow|quick|early|late|new|old|young|modern|traditional|recent|future|past|present|current|next|last|first|second|final|complete|partial|full|empty|open|closed|active|passive|strong|weak|hard|soft|hot|cold|warm|cool|wet|dry|clean|dirty|safe|dangerous|healthy|sick|alive|dead|real|fake|true|false|right|wrong|correct|incorrect|exact|approximate|similar|different|equal|unequal|fair|unfair|legal|illegal|moral|immoral|ethical|unethical)\b[^\"]*\""
+          )
+          
+          hardcoded_found=false
+          
+          # Find React/Next.js component files
+          component_files=$(find src app components pages -name "*.tsx" -o -name "*.jsx" -o -name "*.ts" -o -name "*.js" 2>/dev/null | grep -v node_modules | head -50)
+          
+          if [ -z "$component_files" ]; then
+            echo "ℹ️ No component files found to scan"
+            exit 0
+          fi
+          
+          echo "Scanning files for hardcoded text:"
+          
+          for file in $component_files; do
+            if [ -f "$file" ]; then
+              echo "  📄 $file"
+              
+              # Look for suspicious hardcoded strings (basic patterns)
+              # Check for text in JSX that's not using translation functions
+              suspicious_text=$(grep -n ">[A-Z][a-zA-Z ]{5,}<\|title=\"[A-Z][a-zA-Z ]{5,}\"\|placeholder=\"[A-Z][a-zA-Z ]{5,}\"" "$file" | grep -v "t(\|useTranslations\|getTranslations\|_\(" | head -5)
+              
+              if [ ! -z "$suspicious_text" ]; then
+                echo "    ⚠️ Potential hardcoded text:"
+                echo "$suspicious_text" | sed 's/^/      /'
+                hardcoded_found=true
+              fi
+              
+              # Check for console.log with text (should use keys)
+              console_text=$(grep -n "console\.log.*['\"][A-Z][a-zA-Z ]{5,}['\"]" "$file" | head -3)
+              if [ ! -z "$console_text" ]; then
+                echo "    ⚠️ Console.log with hardcoded text:"
+                echo "$console_text" | sed 's/^/      /'
+              fi
+            fi
+          done
+          
+          if [ "$hardcoded_found" = true ]; then
+            echo ""
+            echo "⚠️ Found potential hardcoded text that should be internationalized"
+            echo "Consider using next-intl or your i18n solution to replace hardcoded strings"
+            # Don't fail for hardcoded text - just warn
+          else
+            echo "✅ No obvious hardcoded text patterns found"
+          fi
+
+  # Job 5: i18n configuration check
+  check-i18n-config:
+    name: ⚙️ Check i18n Configuration
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Validate i18n configuration
+        run: |
+          echo "⚙️ Checking i18n configuration..."
+          
+          # Check for next-intl configuration
+          if [ -f "next.config.ts" ] || [ -f "next.config.js" ]; then
+            echo "✅ Next.js config found"
+            
+            config_file="next.config.ts"
+            [ -f "next.config.js" ] && config_file="next.config.js"
+            
+            if grep -q "next-intl\|createNextIntlPlugin\|i18n" "$config_file"; then
+              echo "✅ next-intl configuration found in $config_file"
+            else
+              echo "⚠️ No i18n configuration found in $config_file"
+            fi
+          else
+            echo "⚠️ No Next.js config file found"
+          fi
+          
+          # Check for i18n routing configuration
+          if [ -f "src/i18n.ts" ] || [ -f "src/i18n/index.ts" ] || [ -f "i18n.ts" ]; then
+            echo "✅ i18n configuration file found"
+          else
+            echo "⚠️ No i18n configuration file found"
+          fi
+          
+          # Check for middleware (required for i18n routing)
+          if [ -f "src/middleware.ts" ] || [ -f "middleware.ts" ]; then
+            echo "✅ Middleware file found"
+            
+            middleware_file="src/middleware.ts"
+            [ -f "middleware.ts" ] && middleware_file="middleware.ts"
+            
+            if grep -q "next-intl\|createMiddleware\|i18n" "$middleware_file"; then
+              echo "✅ i18n middleware configuration found"
+            else
+              echo "⚠️ No i18n middleware configuration found in $middleware_file"
+            fi
+          else
+            echo "⚠️ No middleware file found (required for i18n routing)"
+          fi
+          
+          # Check package.json for i18n dependencies
+          if [ -f "package.json" ]; then
+            if grep -q "next-intl\|react-intl\|i18next" package.json; then
+              echo "✅ i18n dependencies found in package.json"
+            else
+              echo "⚠️ No i18n dependencies found in package.json"
+            fi
+          fi
+
+  # Job 6: i18n summary
+  i18n-summary:
+    name: 📋 i18n Summary
+    runs-on: ubuntu-latest
+    needs: [find-translations, validate-structure, check-key-consistency, scan-hardcoded-text, check-i18n-config]
+    if: always()
+    steps:
+      - name: 📋 Generate i18n summary
+        run: |
+          echo "## 🌍 i18n Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY  
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Translation Files | ${{ needs.find-translations.result == 'success' && '✅ Found' || '⚠️ None Found' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Structure Validation | ${{ needs.validate-structure.result == 'success' && '✅ Passed' || needs.validate-structure.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Key Consistency | ${{ needs.check-key-consistency.result == 'success' && '✅ Passed' || needs.check-key-consistency.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Hardcoded Text Scan | ${{ needs.scan-hardcoded-text.result == 'success' && '✅ Passed' || '⚠️ Warnings' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Configuration Check | ${{ needs.check-i18n-config.result == 'success' && '✅ Passed' || '⚠️ Issues' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Supported Locales" >> $GITHUB_STEP_SUMMARY
+          echo "- 🇫🇷 French (fr)" >> $GITHUB_STEP_SUMMARY
+          echo "- 🇳🇱 Dutch (nl)" >> $GITHUB_STEP_SUMMARY
+          echo "- 🇺🇸 English (en)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📝 Recommendations" >> $GITHUB_STEP_SUMMARY
+          echo "- Use next-intl for internationalization" >> $GITHUB_STEP_SUMMARY
+          echo "- Keep translation keys consistent across locales" >> $GITHUB_STEP_SUMMARY
+          echo "- Avoid hardcoded text in components" >> $GITHUB_STEP_SUMMARY
+          echo "- Configure middleware for locale routing" >> $GITHUB_STEP_SUMMARY

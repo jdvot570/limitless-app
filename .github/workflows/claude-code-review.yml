@@ -3,22 +3,34 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+    # Rate limiting: Only run on code changes
+    paths:
+      - "src/**/*.ts"
+      - "src/**/*.tsx"
+      - "src/**/*.js"
+      - "src/**/*.jsx"
+      - "app/**/*.ts"
+      - "app/**/*.tsx"
+      - "lib/**/*.ts"
+      - "components/**/*.tsx"
+      - "*.json"
+      - "*.config.*"
+
+# Concurrency control: one review per PR at a time
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+    # Rate limiting: Skip for dependabot and small changes
+    if: |
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.changed_files > 0 &&
+      github.event.pull_request.additions + github.event.pull_request.deletions > 10
     
     runs-on: ubuntu-latest
+    timeout-minutes: 10  # Prevent runaway jobs
     permissions:
       contents: read
       pull-requests: read
@@ -34,6 +46,7 @@ jobs:
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
+        continue-on-error: true  # Don't block PR if review fails
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
@@ -41,14 +54,41 @@ jobs:
             - Code quality and best practices
             - Potential bugs or issues
             - Performance considerations
-            - Security concerns
+            - Security concerns (ESPECIALLY: no secrets/PII, proper env var handling)
             - Test coverage
+            - i18n compliance (fr/nl/en)
+            - Alignment with MVP0 DoD (see CLAUDE.md)
             
             Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
+            Focus on critical issues first. Keep review concise.
 
             Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
           
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://docs.anthropic.com/en/docs/claude-code/sdk#command-line for available options
           claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+
+      - name: Handle Review Failure
+        if: steps.claude-review.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '⚠️ Claude review failed to complete. Please review manually or retry the workflow.'
+            })
+
+      - name: Add Review Status Check
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.claude-review.outcome }}';
+            const emoji = status === 'success' ? '✅' : status === 'failure' ? '❌' : '⏭️';
+            const message = status === 'success' ? 'Claude review completed' : 
+                           status === 'failure' ? 'Claude review failed' : 
+                           'Claude review skipped';
+            console.log(`${emoji} ${message}`);
 

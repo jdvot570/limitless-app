@@ -1,0 +1,266 @@
+name: 🔒 Security Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run security audit weekly on Mondays at 9 AM UTC
+    - cron: '0 9 * * 1'
+
+# Security workflows should not be cancelled
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # Job 1: Secret scanning and pattern detection
+  secret-scan:
+    name: 🔍 Secret & Pattern Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for better secret detection
+          fetch-depth: 0
+
+      - name: 🔍 Scan for secrets in code
+        run: |
+          echo "🔍 Scanning for exposed secrets and sensitive patterns..."
+          
+          # Define patterns to search for
+          PATTERNS=(
+            "STRIPE_SECRET_KEY"
+            "SUPABASE_SERVICE_ROLE_KEY"
+            "SUPABASE_ANON_KEY.*sk_live"
+            "NEXT_PUBLIC.*[sS]ecret"
+            "password.*="
+            "api[_-]?key.*="
+            "secret.*="
+            "token.*="
+            "auth.*key.*="
+            "[A-Za-z0-9]{32,}"  # Long random strings
+            "sk_live_[A-Za-z0-9]+"  # Stripe live keys
+            "sk_test_[A-Za-z0-9]+"  # Stripe test keys (also sensitive)
+            "eyJ[A-Za-z0-9_/+\-]*\.[A-Za-z0-9_/+\-]*\.[A-Za-z0-9_/+\-]*"  # JWT tokens
+          )
+          
+          FOUND_ISSUES=0
+          
+          for pattern in "${PATTERNS[@]}"; do
+            echo "Checking pattern: $pattern"
+            matches=$(grep -r -i -n --exclude-dir=node_modules --exclude-dir=.git --exclude="*.log" "$pattern" . || true)
+            
+            if [ ! -z "$matches" ]; then
+              echo "⚠️ Potential secret found for pattern '$pattern':"
+              echo "$matches"
+              FOUND_ISSUES=$((FOUND_ISSUES + 1))
+            fi
+          done
+          
+          # Check for hardcoded URLs that might contain secrets
+          echo "🌐 Checking for hardcoded sensitive URLs..."
+          hardcoded_urls=$(grep -r -n --exclude-dir=node_modules --exclude-dir=.git "https://.*@" . || true)
+          if [ ! -z "$hardcoded_urls" ]; then
+            echo "⚠️ Potential hardcoded URLs with credentials:"
+            echo "$hardcoded_urls"
+            FOUND_ISSUES=$((FOUND_ISSUES + 1))
+          fi
+          
+          if [ $FOUND_ISSUES -gt 0 ]; then
+            echo "❌ Found $FOUND_ISSUES potential security issues"
+            echo "Please review the above findings and ensure no real secrets are exposed"
+            exit 1
+          else
+            echo "✅ No obvious secrets or sensitive patterns detected"
+          fi
+
+      - name: 🔍 Check for PII patterns (GDPR compliance)
+        run: |
+          echo "🛡️ Scanning for potential PII in logs and code..."
+          
+          # GDPR-sensitive patterns that shouldn't appear in logs
+          PII_PATTERNS=(
+            "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"  # Email addresses
+            "\b\d{16}\b"                                       # Credit card numbers
+            "\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"     # Formatted card numbers
+            "\b\d{3}-\d{2}-\d{4}\b"                          # SSN format
+            "console\.log.*email"                             # Logging email
+            "console\.log.*password"                          # Logging password
+            "console\.log.*card"                              # Logging card info
+            "console\.log.*user.*id"                          # Logging user IDs
+          )
+          
+          PII_FOUND=0
+          
+          for pattern in "${PII_PATTERNS[@]}"; do
+            matches=$(grep -r -i -n --exclude-dir=node_modules --exclude-dir=.git --exclude="*.log" -E "$pattern" . || true)
+            
+            if [ ! -z "$matches" ]; then
+              echo "⚠️ Potential PII found for pattern '$pattern':"
+              echo "$matches"
+              PII_FOUND=$((PII_FOUND + 1))
+            fi
+          done
+          
+          if [ $PII_FOUND -gt 0 ]; then
+            echo "⚠️ Found $PII_FOUND potential PII issues - review for GDPR compliance"
+            # Don't fail for PII - just warn
+          else
+            echo "✅ No obvious PII patterns detected"
+          fi
+
+  # Job 2: Dependency vulnerability audit
+  dependency-audit:
+    name: 🔒 Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 🔒 Run npm audit
+        run: |
+          echo "🔍 Running npm audit for vulnerabilities..."
+          
+          # Run audit and capture output
+          if npm audit --audit-level=moderate; then
+            echo "✅ No moderate or higher vulnerabilities found"
+          else
+            echo "⚠️ Vulnerabilities found - checking severity..."
+            
+            # Get detailed audit info
+            npm audit --json > audit-results.json || true
+            
+            if [ -f "audit-results.json" ]; then
+              # Check for high/critical vulnerabilities
+              high_critical=$(jq '.metadata.vulnerabilities.high + .metadata.vulnerabilities.critical' audit-results.json 2>/dev/null || echo "0")
+              
+              if [ "$high_critical" -gt 0 ]; then
+                echo "❌ Found $high_critical high/critical vulnerabilities"
+                npm audit --audit-level=high
+                exit 1
+              else
+                echo "⚠️ Only low/moderate vulnerabilities found - proceeding with warning"
+                npm audit --audit-level=moderate || true
+              fi
+            fi
+          fi
+
+      - name: 📊 Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-results
+          path: audit-results.json
+          retention-days: 30
+
+  # Job 3: OWASP dependency check (if enabled)
+  owasp-check:
+    name: 🛡️ OWASP Dependency Check
+    runs-on: ubuntu-latest
+    # Only run on main branch or when specifically requested
+    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'security-scan')
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🛡️ Run OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        id: depcheck
+        with:
+          project: 'Limitless-MVP0'
+          path: '.'
+          format: 'ALL'
+          args: >
+            --enableRetired
+            --enableExperimental
+            --exclude "**/*.gif"
+            --exclude "**/*.png"
+            --exclude "**/*.jpg"
+            --exclude "**/node_modules/**"
+
+      - name: 📊 Upload OWASP results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-dependency-check-reports
+          path: reports/
+          retention-days: 30
+
+  # Job 4: Environment configuration check
+  env-config-check:
+    name: ⚙️ Environment Config Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Check environment configuration
+        run: |
+          echo "🔍 Checking environment configuration security..."
+          
+          # Check for proper env var usage in Next.js
+          if [ -f "next.config.ts" ] || [ -f "next.config.js" ]; then
+            echo "✅ Next.js config file found"
+            
+            # Check if NEXT_PUBLIC_ vars don't contain secrets
+            public_secrets=$(grep -r "NEXT_PUBLIC.*SECRET\|NEXT_PUBLIC.*KEY\|NEXT_PUBLIC.*TOKEN" . --exclude-dir=node_modules || true)
+            if [ ! -z "$public_secrets" ]; then
+              echo "❌ Found potentially secret values in NEXT_PUBLIC_ variables:"
+              echo "$public_secrets"
+              echo "NEXT_PUBLIC_ variables are exposed to the client!"
+              exit 1
+            fi
+          fi
+          
+          # Check for .env.example file
+          if [ -f ".env.example" ]; then
+            echo "✅ Found .env.example file"
+          else
+            echo "⚠️ No .env.example file found - consider creating one for documentation"
+          fi
+          
+          # Check that .env files are gitignored
+          if grep -q "\.env" .gitignore 2>/dev/null; then
+            echo "✅ .env files are properly gitignored"
+          else
+            echo "❌ .env files are not gitignored - this is a security risk!"
+            exit 1
+          fi
+
+  # Job 5: Security summary
+  security-summary:
+    name: 📋 Security Summary
+    runs-on: ubuntu-latest
+    needs: [secret-scan, dependency-audit, env-config-check]
+    if: always()
+    steps:
+      - name: 📋 Generate security summary
+        run: |
+          echo "## 🔒 Security Audit Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Scan | ${{ needs.secret-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Audit | ${{ needs.dependency-audit.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment Config | ${{ needs.env-config-check.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🛡️ GDPR Compliance Notes" >> $GITHUB_STEP_SUMMARY
+          echo "- No card data should be stored (using Stripe Checkout)" >> $GITHUB_STEP_SUMMARY
+          echo "- Minimize PII in logs and error messages" >> $GITHUB_STEP_SUMMARY
+          echo "- Ensure proper data retention policies" >> $GITHUB_STEP_SUMMARY
+
+      - name: ❌ Fail if critical security issues found
+        if: needs.secret-scan.result == 'failure'
+        run: |
+          echo "❌ Critical security issues found - failing the workflow"
+          exit 1

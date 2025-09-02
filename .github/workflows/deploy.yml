@@ -1,0 +1,425 @@
+name: 🚀 Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual deployment
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'preview'
+        type: choice
+        options:
+          - preview
+          - production
+
+# Prevent concurrent deployments to the same environment
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.environment || 'auto' }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  # Job 1: Environment validation
+  validate-environment:
+    name: ✅ Validate Environment
+    runs-on: ubuntu-latest
+    outputs:
+      deploy-type: ${{ steps.determine.outputs.deploy-type }}
+      environment: ${{ steps.determine.outputs.environment }}
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🎯 Determine deployment type
+        id: determine
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "deploy-type=manual" >> $GITHUB_OUTPUT
+            echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "📝 Manual deployment to ${{ inputs.environment }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ github.event_name }}" = "push" ]; then
+            echo "deploy-type=production" >> $GITHUB_OUTPUT  
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "🚀 Production deployment (main branch push)"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "deploy-type=preview" >> $GITHUB_OUTPUT
+            echo "environment=preview" >> $GITHUB_OUTPUT
+            echo "👁️ Preview deployment (pull request)"
+          else
+            echo "deploy-type=none" >> $GITHUB_OUTPUT
+            echo "environment=none" >> $GITHUB_OUTPUT
+            echo "⏭️ No deployment needed for this trigger"
+          fi
+
+      - name: 🔐 Validate required secrets
+        if: steps.determine.outputs.deploy-type != 'none'
+        run: |
+          echo "🔐 Validating deployment secrets..."
+          
+          missing_secrets=""
+          
+          if [ -z "$VERCEL_ORG_ID" ]; then
+            missing_secrets="$missing_secrets VERCEL_ORG_ID"
+          fi
+          
+          if [ -z "$VERCEL_PROJECT_ID" ]; then
+            missing_secrets="$missing_secrets VERCEL_PROJECT_ID"
+          fi
+          
+          if [ -z "${{ secrets.VERCEL_TOKEN }}" ]; then
+            missing_secrets="$missing_secrets VERCEL_TOKEN"
+          fi
+          
+          if [ ! -z "$missing_secrets" ]; then
+            echo "❌ Missing required secrets:$missing_secrets"
+            echo "Please configure these secrets in your GitHub repository settings:"
+            echo "- VERCEL_ORG_ID: Your Vercel organization ID"
+            echo "- VERCEL_PROJECT_ID: Your Vercel project ID"  
+            echo "- VERCEL_TOKEN: Your Vercel deployment token"
+            exit 1
+          else
+            echo "✅ All required secrets are configured"
+          fi
+
+  # Job 2: Pre-deployment build and tests
+  pre-deploy-checks:
+    name: 🧪 Pre-deployment Checks
+    runs-on: ubuntu-latest
+    needs: validate-environment
+    if: needs.validate-environment.outputs.deploy-type != 'none'
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📥 Install dependencies
+        run: npm ci --prefer-offline --no-audit
+
+      - name: 🔧 Type check
+        run: npm run type-check
+
+      - name: 🧹 Lint
+        run: npm run lint
+
+      - name: 🏗️ Build application
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+          # Use environment-specific variables
+          NODE_ENV: ${{ needs.validate-environment.outputs.environment == 'production' && 'production' || 'development' }}
+
+      - name: 🧪 Run tests
+        run: npm run test
+
+      - name: 📊 Build size analysis
+        run: |
+          echo "📊 Build size analysis:"
+          if [ -d ".next" ]; then
+            du -sh .next/
+            find .next/static -name "*.js" -exec du -h {} + | sort -hr | head -5 | sed 's/^/  /'
+          fi
+
+  # Job 3: Deploy to Vercel
+  deploy-vercel:
+    name: 🚀 Deploy to Vercel
+    runs-on: ubuntu-latest
+    needs: [validate-environment, pre-deploy-checks]
+    if: needs.validate-environment.outputs.deploy-type != 'none'
+    environment:
+      name: ${{ needs.validate-environment.outputs.environment }}
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      deployment-url: ${{ steps.deploy.outputs.url }}
+      deployment-id: ${{ steps.deploy.outputs.deployment-id }}
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 📥 Install Vercel CLI
+        run: npm install --global vercel@canary
+
+      - name: 🔗 Link Vercel project
+        run: |
+          echo "🔗 Linking to Vercel project..."
+          vercel link --yes --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
+
+      - name: 📋 Set environment variables
+        run: |
+          echo "📋 Configuring environment variables..."
+          
+          # Set common environment variables
+          if [ "${{ needs.validate-environment.outputs.environment }}" = "production" ]; then
+            echo "🔴 Production deployment"
+            # Production-specific environment variables would go here
+          else
+            echo "🟡 Preview deployment"
+            # Preview-specific environment variables would go here
+          fi
+
+      - name: 🏗️ Build with Vercel
+        id: build
+        run: |
+          echo "🏗️ Building with Vercel..."
+          
+          if [ "${{ needs.validate-environment.outputs.environment }}" = "production" ]; then
+            vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+          else
+            vercel build --token=${{ secrets.VERCEL_TOKEN }}
+          fi
+        env:
+          VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
+
+      - name: 🚀 Deploy to Vercel
+        id: deploy
+        run: |
+          echo "🚀 Deploying to Vercel..."
+          
+          if [ "${{ needs.validate-environment.outputs.environment }}" = "production" ]; then
+            deployment_url=$(vercel deploy --prod --prebuilt --token=${{ secrets.VERCEL_TOKEN }})
+          else
+            deployment_url=$(vercel deploy --prebuilt --token=${{ secrets.VERCEL_TOKEN }})
+          fi
+          
+          echo "✅ Deployed to: $deployment_url"
+          echo "url=$deployment_url" >> $GITHUB_OUTPUT
+          
+          # Extract deployment ID from URL for later use
+          deployment_id=$(echo "$deployment_url" | sed 's/.*\/\/\([^.]*\)\..*/\1/')
+          echo "deployment-id=$deployment_id" >> $GITHUB_OUTPUT
+        env:
+          VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
+
+      - name: 📝 Add deployment comment (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deploymentUrl = '${{ steps.deploy.outputs.url }}';
+            const comment = `## 🚀 Deployment Preview
+            
+            Your changes have been deployed to Vercel!
+            
+            **🔗 Preview URL:** ${deploymentUrl}
+            
+            **📊 Deployment Details:**
+            - Environment: Preview
+            - Commit: \`${{ github.sha }}\`
+            - Branch: \`${{ github.head_ref }}\`
+            
+            ---
+            *This comment will be automatically updated on new commits.*`;
+            
+            // Check if a deployment comment already exists
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.body.includes('🚀 Deployment Preview')
+            );
+            
+            if (existingComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+
+  # Job 4: Post-deployment validation
+  post-deploy-validation:
+    name: ✅ Post-deployment Validation  
+    runs-on: ubuntu-latest
+    needs: [validate-environment, deploy-vercel]
+    if: needs.validate-environment.outputs.deploy-type != 'none'
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🏥 Health check
+        run: |
+          echo "🏥 Performing health check on ${{ needs.deploy-vercel.outputs.deployment-url }}"
+          
+          deployment_url="${{ needs.deploy-vercel.outputs.deployment-url }}"
+          
+          # Wait a bit for deployment to be ready
+          echo "⏳ Waiting for deployment to be ready..."
+          sleep 30
+          
+          # Basic health check
+          max_attempts=10
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "🔍 Health check attempt $attempt/$max_attempts"
+            
+            response=$(curl -s -o /dev/null -w "%{http_code}" "$deployment_url" || echo "000")
+            
+            if [ "$response" = "200" ]; then
+              echo "✅ Health check passed - HTTP $response"
+              break
+            else
+              echo "⚠️ Health check failed - HTTP $response"
+              
+              if [ $attempt -eq $max_attempts ]; then
+                echo "❌ Health check failed after $max_attempts attempts"
+                exit 1
+              fi
+              
+              echo "⏳ Waiting 10 seconds before retry..."
+              sleep 10
+            fi
+            
+            attempt=$((attempt + 1))
+          done
+
+      - name: 🧪 Basic smoke tests
+        run: |
+          echo "🧪 Running basic smoke tests..."
+          
+          deployment_url="${{ needs.deploy-vercel.outputs.deployment-url }}"
+          
+          # Test if the page contains expected content
+          echo "📄 Testing page content..."
+          page_content=$(curl -s "$deployment_url" || echo "")
+          
+          if echo "$page_content" | grep -q "<html"; then
+            echo "✅ Valid HTML page detected"
+          else
+            echo "❌ No valid HTML found in response"
+            exit 1
+          fi
+          
+          # Test if Next.js is working (look for Next.js markers)
+          if echo "$page_content" | grep -q "__NEXT\|next/script\|_next/static"; then
+            echo "✅ Next.js application detected"
+          else
+            echo "⚠️ Next.js markers not found - may be static content"
+          fi
+          
+          # Test if the page is mobile-friendly (basic check)
+          if echo "$page_content" | grep -q "viewport"; then
+            echo "✅ Mobile-friendly viewport meta tag found"
+          else
+            echo "⚠️ No viewport meta tag found"
+          fi
+
+      - name: 🔍 Performance check
+        run: |
+          echo "🔍 Basic performance check..."
+          
+          deployment_url="${{ needs.deploy-vercel.outputs.deployment-url }}"
+          
+          # Measure response time
+          response_time=$(curl -o /dev/null -s -w "%{time_total}" "$deployment_url" || echo "0")
+          
+          echo "⏱️ Response time: ${response_time}s"
+          
+          # Convert to milliseconds for comparison
+          response_ms=$(echo "$response_time * 1000" | bc -l | cut -d. -f1)
+          
+          if [ "$response_ms" -lt 3000 ]; then
+            echo "✅ Good response time (< 3s)"
+          elif [ "$response_ms" -lt 5000 ]; then
+            echo "⚠️ Acceptable response time (3-5s)"
+          else
+            echo "❌ Slow response time (> 5s)"
+          fi
+
+  # Job 5: Deployment summary
+  deployment-summary:
+    name: 📋 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [validate-environment, deploy-vercel, post-deploy-validation]
+    if: always() && needs.validate-environment.outputs.deploy-type != 'none'
+    steps:
+      - name: 📋 Generate deployment summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.deploy-vercel.result }}" = "success" ]; then
+            echo "✅ **Deployment Status:** Success" >> $GITHUB_STEP_SUMMARY
+            echo "🔗 **URL:** ${{ needs.deploy-vercel.outputs.deployment-url }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment Status:** Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment Validation | ${{ needs.validate-environment.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pre-deployment Checks | ${{ needs.pre-deploy-checks.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Vercel Deployment | ${{ needs.deploy-vercel.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Post-deployment Validation | ${{ needs.post-deploy-validation.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### 📊 Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ needs.validate-environment.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type:** ${{ needs.validate-environment.outputs.deploy-type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "- **PR:** #${{ github.event.number }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: 🎉 Success notification
+        if: needs.deploy-vercel.result == 'success' && needs.post-deploy-validation.result == 'success'
+        run: |
+          echo "🎉 Deployment completed successfully!"
+          echo "🔗 Your application is live at: ${{ needs.deploy-vercel.outputs.deployment-url }}"
+          
+          if [ "${{ needs.validate-environment.outputs.environment }}" = "production" ]; then
+            echo "🚀 Production deployment complete!"
+          else
+            echo "👁️ Preview deployment ready for testing!"
+          fi
+
+      - name: ❌ Failure notification
+        if: failure()
+        run: |
+          echo "❌ Deployment failed!"
+          echo "Please check the logs above for details."
+          echo ""
+          echo "Common issues:"
+          echo "- Missing environment variables"
+          echo "- Build failures"
+          echo "- Invalid Vercel configuration"
+          echo "- Network connectivity issues"
