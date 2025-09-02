@@ -1,0 +1,4 @@
+# Require at least one human owner + AI review for critical paths
+/apps/**       @limitless-core/devs
+/packages/**   @limitless-core/devs
+/database/**   @limitless-core/devs
