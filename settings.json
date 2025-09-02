@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run lint)",
+      "Bash(npm run build)",
+      "Bash(npm run test:*)",
+      "Read(./README.md)",
+      "Read(./docs/**)",
+      "Read(./apps/**)",
+      "Read(./packages/**)",
+      "Read(./agents/**)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Write(./apps/**)",
+      "Edit(./apps/**)",
+      "Write(./packages/**)",
+      "Edit(./packages/**)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(./config/credentials.json)",
+      "Write(./.env)",
+      "Write(./.env.*)",
+      "Write(./secrets/**)",
+      "Write(./config/credentials.json)"
+    ]
+  },
+  "model": "claude-3.5-sonnet-latest",
+  "includeCoAuthoredBy": false,
+  "outputStyle": "Explanatory"
+}
